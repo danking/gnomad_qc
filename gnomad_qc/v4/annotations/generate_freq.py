@@ -76,16 +76,10 @@ def annotate_high_ab_hets_by_group_membership(
     """
     logger.info("Annotating number of high AB het sites in each freq group...")
     mt = mt.annotate_rows(
-        high_ab_hets_by_group_membership=hl.agg.array_agg(
-            lambda i: hl.agg.filter(
-                mt.group_membership[i]
-                & needs_high_ab_het_fix_expr(
-                    mt,
-                    ab_cutoff,
-                ),
-                hl.agg.count(),
+        high_ab_hets_by_group_membership=hl.agg.array_sum(
+            mt.group_membership.map(
+                lambda x: hl.int(x & needs_high_ab_het_fix_expr(mt, ab_cutoff))
             ),
-            hl.range(hl.len(mt.group_membership)),
         )
     )
     return mt
@@ -241,6 +235,11 @@ def generate_faf_popmax(mt: hl.MatrixTable) -> hl.MatrixTable:
 
 def main(args):  # noqa: D103
     # TODO: Determine if splitting subset freq from whole callset agg
+
+    from datetime import datetime
+
+    start_time = datetime.now()
+
     subsets = args.subsets
     test = args.test
     chrom = args.chrom
@@ -254,7 +253,7 @@ def main(args):  # noqa: D103
     )
     # TODO: Update to release = True once outlier filtering is complete,
     # possibly sample_meta=True if added
-    vds = get_gnomad_v4_vds(test=test, release_only=True)
+    vds = get_gnomad_v4_vds(n_partitions=150000, release_only=True)
     meta_ht = meta.ht()
     final_anns = []
 
@@ -267,14 +266,18 @@ def main(args):  # noqa: D103
     if test or chrom:
         if test:
             logger.info("Filtering to DRD2 in test VDS for testing purposes...")
-            test_interval = [
-                hl.parse_locus_interval("chr11:113409605-113475691")
-            ]  # NOTE: test on gene DRD2 for now, will update to chr22 when original PR goes in
-            vds = hl.vds.filter_intervals(vds, test_interval)
-            variants, samples = vds.variant_data.count()
-            logger.info(
-                "Test VDS has %s variants in DRD2 in %s samples...", variants, samples
+            # test_interval = [
+            #    hl.parse_locus_interval("chr11:113409605-113475691")
+            # ]  # NOTE: test on gene DRD2 for now, will update to chr22 when original PR goes in
+            vds = hl.vds.VariantDataset(
+                vds.reference_data._filter_partitions(range(2)),
+                vds.variant_data._filter_partitions(range(2)),
             )
+            # vds = hl.vds.filter_intervals(vds, test_interval)
+            # variants, samples = vds.variant_data.count()
+            # logger.info(
+            #    "Test VDS has %s variants in DRD2 in %s samples...", variants, samples
+            # )
         else:
             logger.info("Filtering to chromosome %s...", chrom)
             vds = hl.vds.filter_chromosomes(vds, keep=chrom)
@@ -295,11 +298,14 @@ def main(args):  # noqa: D103
 
     logger.info("Computing adj and sex adjusted genotypes...")
     mt = mt.annotate_entries(
+        # "_het_non_ref",
         GT=adjusted_sex_ploidy_expr(
             mt.locus, mt.GT, mt.meta.sex_imputation.sex_karyotype
         ),
         adj=get_adj_expr(mt.GT, mt.GQ, mt.DP, mt.AD),
     )
+
+    # mt = mt.checkpoint("gs://gnomad-tmp/julia/dense_mt_test.mt", overwrite=True)
 
     if args.get_freq_and_high_ab:
         logger.info("Annotating frequencies...")
@@ -356,10 +362,13 @@ def main(args):  # noqa: D103
     logger.info(f"{final_anns} are the final annotations")
     ht = mt.rows()
     ht = ht.select(*final_anns)
-    ht = ht.write(
-        get_freq(test=test, hom_alt_adjustment=adjust_freqs, chr=chrom).path,
+    ht.write(
+        "gs://gnomad-tmp/julia/gnomad_v4_freq_highmem_32.ht",
         overwrite=args.overwrite,
     )
+
+    end_time = datetime.now()
+    logger.info(f"Duration: {end_time - start_time}")
 
 
 if __name__ == "__main__":
