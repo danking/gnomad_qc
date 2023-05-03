@@ -297,7 +297,7 @@ def main(args):  # noqa: D103
     mt = hl.vds.to_dense_mt(vds)  # TODO: Move this to get_gnomad_v4_vds
 
     logger.info("Computing adj and sex adjusted genotypes...")
-    mt = mt.annotate_entries(
+    mt = mt.select_entries(
         "_het_non_ref",
         "AD",
         "DP",
