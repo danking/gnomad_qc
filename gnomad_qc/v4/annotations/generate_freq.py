@@ -298,14 +298,16 @@ def main(args):  # noqa: D103
 
     logger.info("Computing adj and sex adjusted genotypes...")
     mt = mt.annotate_entries(
-        # "_het_non_ref",
+        "_het_non_ref",
+        "AD",
+        "DP",
         GT=adjusted_sex_ploidy_expr(
             mt.locus, mt.GT, mt.meta.sex_imputation.sex_karyotype
         ),
         adj=get_adj_expr(mt.GT, mt.GQ, mt.DP, mt.AD),
     )
 
-    # mt = mt.checkpoint("gs://gnomad-tmp/julia/dense_mt_test.mt", overwrite=True)
+    mt = mt.checkpoint("gs://gnomad-tmp/julia/dense_mt_test.mt", overwrite=True)
 
     if args.get_freq_and_high_ab:
         logger.info("Annotating frequencies...")
