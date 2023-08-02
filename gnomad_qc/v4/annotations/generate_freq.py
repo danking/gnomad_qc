@@ -50,20 +50,36 @@ logging.basicConfig(
 logger = logging.getLogger("gnomAD_frequency")
 logger.setLevel(logging.INFO)
 
+AGE_HISTS = [
+    "age_hist_het",
+    "age_hist_hom",
+]
+QUAL_HISTS = [
+    "gq_hist_all",
+    "dp_hist_all",
+    "gq_hist_alt",
+    "dp_hist_alt",
+    "ab_hist_alt",
+]
+
 FREQ_ROW_FIELDS = [
     "freq",
     "high_ab_hets_by_group_membership",
     "qual_hists",
     "raw_qual_hists",
-    "age_hist_het",
-    "age_hist_hom",
+    "age_hists",
 ]
 """
 List of final top level row and global annotations created from dense data that we
 want on the frequency HT before deciding on the AF cutoff.
 """
 
-FREQ_GLOBAL_FIELDS = ["freq_meta", "age_distribution"]
+FREQ_GLOBAL_FIELDS = [
+    "downsamplings",
+    "freq_meta",
+    "age_distribution",
+    "freq_index_dict",
+]
 """
 List of final global annotations created from dense data that we want on the frequency
 HT before deciding on the AF cutoff.
@@ -150,39 +166,36 @@ def get_vds_for_freq(
         vds = hl.vds.filter_intervals(vds, test_interval, split_reference_blocks=True)
 
     logger.info("Annotating VDS with only necessary sample metadata...")
-    vds = hl.vds.VariantDataset(
-        vds.reference_data,
-        vds.variant_data.select_cols(
-            pop=vds.variant_data.meta.population_inference.pop,
-            sex_karyotype=vds.variant_data.meta.sex_imputation.sex_karyotype,
-            fixed_homalt_model=vds.variant_data.meta.project_meta.fixed_homalt_model,
-            gatk_version=vds.variant_data.meta.project_meta.gatk_version,
-            age=vds.variant_data.meta.project_meta.age,
-            sample_age_bin=get_sample_age_bin(vds.variant_data.meta.project_meta.age),
-            ukb_sample=hl.if_else(
-                vds.variant_data.meta.project_meta.ukb_sample, "ukb", "non_ukb"
-            ),
-        ),
+    rmt = vds.reference_data
+    vmt = vds.variant_data
+    project_meta_expr = vmt.meta.project_meta
+    vmt = vmt.select_cols(
+        pop=vmt.meta.population_inference.pop,
+        sex_karyotype=vmt.meta.sex_imputation.sex_karyotype,
+        fixed_homalt_model=project_meta_expr.fixed_homalt_model,
+        gatk_version=project_meta_expr.gatk_version,
+        age=project_meta_expr.age,
+        ukb_sample=hl.if_else(project_meta_expr.ukb_sample, "ukb", "non_ukb"),
+    )
+
+    # TODO: Add comment and logger.
+    vmt = vmt.annotate_globals(
+        age_distribution=vmt.aggregate_cols(hl.agg.hist(vmt.age, 30, 80, 10))
     )
 
     # Downsamplings are done outside the above function as we need to annotate
     # globals and rows.
     logger.info("Annotating downsampling groups...")
-    vds.variant_data = annotate_downsamplings(
-        vds.variant_data, DOWNSAMPLINGS["v4"], pop_expr=vds.variant_data.pop
-    )
+    vmt = annotate_downsamplings(vmt, DOWNSAMPLINGS["v4"], pop_expr=vmt.pop)
 
     logger.info("Annotating non_ref hets pre-split...")
-    vds.variant_data = vds.variant_data.annotate_entries(
-        _het_non_ref=vds.variant_data.LGT.is_het_non_ref()
-    )
+    vmt = vmt.annotate_entries(_het_non_ref=vmt.LGT.is_het_non_ref())
 
     logger.info("Selecting only required fields to reduce memory usage...")
-    vds.variant_data = vds.variant_data.select_entries(
-        "LA", "LAD", "DP", "GQ", "LGT", "_het_non_ref"
-    )
+    vmt = vmt.select_entries("LA", "LAD", "DP", "GQ", "LGT", "_het_non_ref")
 
     logger.info("Spltting mutliallelics in VDS...")
+    vds = hl.vds.VariantDataset(rmt, vmt)
     vds = hl.vds.split_multi(vds, filter_changed_loci=True)
 
     logger.info(
@@ -216,242 +229,6 @@ def annotate_adj_and_select_fields(vds: hl.vds.VariantDataset) -> hl.vds.Variant
         _het_ad=vmt.AD[1],
     )
     return hl.vds.VariantDataset(rmt, vmt)
-
-
-def correct_call_stats(ht: hl.Table, af_threshold: float = 0.01) -> hl.Table:
-    """
-    Correct frequencies at sites with an AF greater than the af_threshold.
-
-    :param ht: Hail Table containing freq and high_ab_het annotations.
-    :param af_threshold: AF threshold at which to correct frequency. Default is 0.01.
-    :return: Hail Table with adjusted frequencies.
-    """
-    ht = ht.annotate(
-        ab_adjusted_freq=hl.if_else(
-            ht.freq[0].AF > af_threshold,
-            hl.map(
-                lambda f, g: hl.struct(
-                    AC=hl.int32(f.AC + g),
-                    AN=f.AN,
-                    homozygote_count=f.homozygote_count + g,
-                    AF=hl.if_else(f.AN > 0, (f.AC + g) / f.AN, hl.missing(hl.tfloat64)),
-                ),
-                ht.freq,
-                ht.high_ab_hets_by_group_membership,
-            ),
-            ht.freq,
-        )
-    )
-
-    return ht
-
-
-def create_high_ab_age_hists_expr(ht: hl.Table, age_group_key="sample_age_bin"):
-    """
-    Create histograms of high ab counts using age bins to account for high AB hets becoming hom alts.
-
-    :param ht: Hail Table containing age hists, AB annotation.
-    :param age_group_key: Age group key to use for age histogram.
-    :return: Hail struct containing age histogram of high ab counts.
-    """
-    non_range_entries = hl.set(["n_larger", "n_smaller"])
-    age_bins_indices = hl.sorted(
-        hl.enumerate(ht["freq_meta"], index_first=False)
-        .filter(lambda x: x[0].contains(age_group_key))
-        .map(lambda x: (x[0][age_group_key], x[1]))
-    )
-
-    age_bins_indices_dict = hl.dict(age_bins_indices)
-    age_bin_indices_no_edges = age_bins_indices.filter(
-        lambda x: ~non_range_entries.contains(x[0])
-    )
-    return hl.struct(
-        bin_freq=hl.starmap(
-            lambda x, y: ht.high_ab_hets_by_group_membership[y],
-            age_bin_indices_no_edges,
-        ),
-        n_smaller=ht.high_ab_hets_by_group_membership[
-            age_bins_indices_dict["n_smaller"]
-        ],
-        n_larger=ht.high_ab_hets_by_group_membership[age_bins_indices_dict["n_larger"]],
-    )
-
-
-def get_sample_age_bin(
-    sample_age: hl.expr.Int32Expression,
-    lower_bound: int = 30,
-    upper_bound: int = 80,
-    number_of_bins: int = 10,
-) -> hl.expr.StringExpression:
-    """
-    Get the age bin for a sample.
-
-    :param sample_age: Sample age.
-    :return: Sample age bin.
-    """
-    bin_size = (upper_bound - lower_bound) / number_of_bins
-    lower_bin = hl.int(
-        hl.floor((sample_age - lower_bound) / bin_size) * bin_size + lower_bound
-    )
-    upper_bin = hl.int(lower_bin + bin_size)
-
-    bin_label = hl.if_else(
-        sample_age < lower_bound,
-        "n_smaller",
-        hl.if_else(
-            sample_age >= upper_bound,
-            "n_larger",
-            hl.str(lower_bin) + "-" + hl.str(upper_bin),
-        ),
-    )
-
-    return hl.or_missing(hl.is_defined(sample_age), bin_label)
-
-
-def compute_age_hist(mt: hl.MatrixTable) -> hl.MatrixTable:
-    """
-    Compute age histograms for each variant.
-
-    :param mt: Input MT with age annotation.
-    :return: MatrixTable with age histogram annotations.
-    """
-    mt = mt.annotate_rows(**age_hists_expr(mt.adj, mt.GT, mt.age))
-
-    # Compute callset-wide age histogram global
-    mt = mt.annotate_globals(
-        age_distribution=mt.aggregate_cols(hl.agg.hist(mt.age, 30, 80, 10))
-    )
-    return mt
-
-
-def correct_age_hists(ht: hl.Table) -> hl.Table:
-    """
-    Correct age histograms.
-
-    Correct by subtracting age_high_ab_hists from age_hist_het and adding
-    age_high_ab_hists to age_hist_hom to account for high AB hets becoming hom alts.
-
-    :param ht: Hail Table containing age hists and hist of AB counts by age annotation.
-    :return: Hail Table
-    """
-    ht = ht.annotate(age_high_ab_hist=create_high_ab_age_hists_expr(ht))
-
-    return ht.annotate(
-        age_hist_het=hl.struct(
-            bin_edges=ht.age_hist_het.bin_edges,
-            bin_freq=hl.map(
-                lambda x, y: x - y,
-                ht.age_hist_het.bin_freq,
-                ht.age_high_ab_hist.bin_freq,
-            ),
-            n_smaller=ht.age_hist_het.n_smaller - ht.age_high_ab_hist.n_smaller,
-            n_larger=ht.age_hist_het.n_larger - ht.age_high_ab_hist.n_larger,
-        ),
-        age_hist_hom=hl.struct(
-            bin_edges=ht.age_hist_hom.bin_edges,
-            bin_freq=hl.map(
-                lambda x, y: x + y,
-                ht.age_hist_hom.bin_freq,
-                ht.age_high_ab_hist.bin_freq,
-            ),
-            n_smaller=ht.age_hist_hom.n_smaller + ht.age_high_ab_hist.n_smaller,
-            n_larger=ht.age_hist_hom.n_larger + ht.age_high_ab_hist.n_larger,
-        ),
-    )
-
-
-def compute_qual_hists(mt: hl.MatrixTable) -> hl.MatrixTable:
-    """
-    Annotate quality metrics histograms.
-
-    :param mt: Input MT.
-    :return: MatrixTable with qual histogram annotations.
-    """
-    mt = mt.annotate_rows(
-        qual_hists=qual_hist_expr(
-            gt_expr=mt.GT,
-            gq_expr=mt.GQ,
-            dp_expr=mt.DP,
-            adj_expr=mt.adj,
-            ab_expr=mt._het_ad / mt.DP,
-        )
-    )
-    mt = mt.annotate_rows(
-        qual_hists=hl.Struct(
-            **{
-                i.replace("_adj", ""): mt.qual_hists[i]
-                for i in mt.qual_hists
-                if "_adj" in i
-            }
-        ),
-        raw_qual_hists=hl.Struct(
-            **{i: mt.qual_hists[i] for i in mt.qual_hists if "_adj" not in i}
-        ),
-    )
-    return mt
-
-
-def correct_qual_hists(ht: hl.Table) -> hl.Table:  # add ab_threshold as arg
-    """
-    Correct quality metrics histograms.
-
-    Correct by accessing the qual_hist and raw_qual_hist structs and removing
-    all counts from the ab_hist_alt array where bin_edges exceed 0.9 AB.
-
-    :param ht: Hail Table containing qual hists, AB annotation.
-    :return: Hail Table
-    """
-
-    def _correct_ab_hist_alt(ab_hist_alt):
-        return hl.struct(
-            bin_edges=ab_hist_alt.bin_edges,
-            bin_freq=hl.map(
-                lambda edge, freq: hl.if_else(edge >= 0.9, 0, freq),
-                ab_hist_alt.bin_edges[:-1],
-                ab_hist_alt.bin_freq,
-            ),
-            n_smaller=ab_hist_alt.n_smaller,
-            n_larger=0,
-        )
-
-    qual_hists = ["qual_hists", "raw_qual_hists"]
-    ht = ht.annotate(
-        **{
-            x: ht[x].annotate(ab_hist_alt=_correct_ab_hist_alt(ht[x].ab_hist_alt))
-            for x in qual_hists
-        }
-    )
-    return ht
-
-
-def generate_faf_grpmax(ht: hl.Table) -> hl.Table:
-    """
-    Compute filtering allele frequencies and grpmax with the AB-adjusted frequencies.
-
-    :param ht: Hail Table containing freq, ab_adjusted_freq, high_ab_het annotations.
-    :return: Hail Table with faf & grpmax annotations.
-    """
-    faf, faf_meta = faf_expr(
-        ht.ab_adjusted_freq, ht.freq_meta, ht.locus, POPS_TO_REMOVE_FOR_POPMAX
-    )
-    ht = ht.annotate(
-        faf=faf,
-        grpmax=pop_max_expr(
-            ht.ab_adjusted_freq, ht.freq_meta, POPS_TO_REMOVE_FOR_POPMAX
-        ),
-    )
-    ht = ht.annotate_globals(
-        faf_meta=faf_meta,
-        faf_index_dict=make_faf_index_dict(faf_meta, label_delimiter="-"),
-    )
-    ht = ht.annotate(
-        grpmax=ht.grpmax.annotate(
-            faf95=ht.faf[
-                ht.faf_meta.index(lambda x: x.values() == ["adj", ht.grpmax.pop])
-            ].faf95
-        )
-    )
-    return ht
 
 
 def generate_freq_and_hists_ht(
@@ -499,9 +276,6 @@ def generate_freq_and_hists_ht(
     additional_strata_expr = [
         {"gatk_version": mt.gatk_version},
         {"gatk_version": mt.gatk_version, "pop": mt.pop},
-        # TODO: We need this to get high AB hets for age histogram correction, dont
-        #  care about the frequency of it, should we drop it?
-        {"sample_age_bin": mt.sample_age_bin},
         # TODO: confirm this is how we want to name this.
         {"ukb_sample": mt.ukb_sample},
     ]
@@ -513,7 +287,7 @@ def generate_freq_and_hists_ht(
             & entry.adj
             & ~col.fixed_homalt_model
             & ~entry._het_non_ref
-        )  # Skip adjusting genotypes if sample originally had a het nonref genotype
+        )  # Skip adjusting genotypes if sample originally had a het nonref genotype.
 
     freq_ht = annotate_freq(
         mt,
@@ -532,201 +306,320 @@ def generate_freq_and_hists_ht(
     logger.info("Making freq index dict...")
     # Add additional strata to the sort order, keeping group, i.e. adj, at the end.
     sort_order = deepcopy(SORT_ORDER)
-    sort_order[-1:-1] = ["gatk_version", "ukb_sample", "sample_age_bin"]
+    sort_order[-1:-1] = ["gatk_version", "ukb_sample"]
 
     freq_ht = freq_ht.annotate_globals(
         freq_index_dict=make_freq_index_dict_from_meta(
             freq_meta=freq_ht.freq_meta,
             label_delimiter="_",
             sort_order=sort_order,
-            # TODO: Check if we actually want to see age_bin, I dont think we do.
         )
     )
     logger.info("Setting Y metrics to NA for XX groups...")
     freq_ht = freq_ht.annotate(freq=set_female_y_metrics_to_na_expr(freq_ht))
 
-    logger.info("Computing quality metrics histograms...")
-    mt = compute_qual_hists(mt)
-
-    logger.info("Computing age histograms for each variant...")
-    mt = compute_age_hist(mt)  # global age distribution is a global
+    logger.info(
+        "Computing quality metrics histograms and age histograms for each variant..."
+    )
+    # TODO: Can I ask a stupid question? Why do we need to add the age strata to
+    #  annotate_freq? Why can't we just compute the corrected hists here?
+    mt = mt.select_rows(
+        **qual_hist_expr(
+            gt_expr=mt.GT,
+            gq_expr=mt.GQ,
+            dp_expr=mt.DP,
+            adj_expr=mt.adj,
+            ab_expr=mt._het_ad / mt.DP,
+            split_adj_and_raw=True,
+        ),
+        age_hists=age_hists_expr(mt.adj, mt.GT, mt.age),
+        high_ab_hets_corrected_age_hists=age_hists_expr(
+            mt.adj,
+            hl.if_else(_needs_high_ab_het_fix(mt, mt) == 1, hl.call(1, 1), mt.GT),
+            mt.age,
+        ),
+    )
 
     hists = mt.rows()[freq_ht.key]
-    final_rows_anns.update(
-        {
-            "qual_hists": hists.qual_hists,
-            "raw_qual_hists": hists.raw_qual_hists,
-            "age_hist_het": hists.age_hist_het,
-            "age_hist_hom": hists.age_hist_hom,
-        }
-    )
-    final_globals_anns.update({"age_distribution": mt.index_globals().age_distribution})
+    final_rows_anns.update({r: hists[r] for r in mt.row_value})
 
     freq_ht = freq_ht.annotate(**final_rows_anns)
     freq_ht = freq_ht.annotate_globals(**final_globals_anns)
 
-    # TODO: Remove after testing.
-    freq_ht.describe()
-    freq_ht = freq_ht.checkpoint(
-        new_temp_file(f"freq_ht_{idx}", extension="ht"),
-        # f"gs://gnomad-mwilson/v4/frequencies/test/freq_ht_{idx}.ht",
-        overwrite=args.overwrite,
-        _read_if_exists=True,
-    )
-
     return freq_ht
 
 
-def merge_histograms(ht: hl.Table, indices: List[int]) -> hl.Table:
+# TODO: Move to gnomad_methods.
+def merge_histograms(hists: List[hl.expr.StructExpression]) -> hl.Table:
     """
     Merge histogram annotations.
 
     This function merges all split histogram annotations by
-    summing the arrays in an element-wise fashion across the like histograms. Histograms
-    that should be merged are named similarly with the index as a suffix. It keeps one
-    bin_edge annotation but merges the bin_freq, n_smaller, and n_larger annotations by
-    summing them.
-    :param ht: Hail Table with histogram annotations.
-    :param indices: List of indices to merge.
-    :return: Hail Table with merged histogram annotations.
+    summing the arrays in an element-wise fashion. It keeps one bin_edge annotation
+    but merges the bin_freq, n_smaller, and n_larger annotations by summing them.
+
+    :param hists: List of histogram structs to merge.
+    :return: Merged histogram struct.
     """
-    age_hists = ["age_hist_het", "age_hist_hom"]
-    qual_hists = [
-        "gq_hist_all",
-        "dp_hist_all",
-        "gq_hist_alt",
-        "dp_hist_alt",
-        "ab_hist_alt",
-    ]
-    hist_structs = {"qual_hists": qual_hists, "raw_qual_hists": qual_hists}
-
-    def _hist_merge(arrays: List[hl.expr.StructExpression]):
-        """
-        Merge histograms.
-
-        :param arrays: List of histogram structs to merge.
-        :return: Merged histogram struct.
-        """
-        return hl.fold(
-            lambda i, j: hl.struct(
-                **{
-                    "bin_edges": (
-                        i.bin_edges
-                    ),  # Bin edges are the same for all histograms
-                    "bin_freq": hl.zip(i.bin_freq, j.bin_freq).map(
-                        lambda x: x[0] + x[1]
-                    ),
-                    "n_smaller": i.n_smaller + j.n_smaller,
-                    "n_larger": i.n_larger + j.n_larger,
-                }
-            ),
-            arrays[0].select("bin_edges", "bin_freq", "n_smaller", "n_larger"),
-            arrays[1:],
-        )
-
-    ht = ht.annotate(
-        **{
-            age_hist: _hist_merge([ht[f"{age_hist}_{idx}"] for idx in indices])
-            for age_hist in age_hists
-        },
-        **{
-            hist_struct: hl.struct(
-                **{
-                    hist: _hist_merge(
-                        [ht[f"{hist_struct}_{idx}"][hist] for idx in indices]
-                    )
-                    for hist in hists
-                }
-            )
-            for hist_struct, hists in hist_structs.items()
-        },
-    )
-    ht = ht.annotate_globals(
-        age_distribution=_hist_merge(
-            [ht.index_globals()[f"age_distribution_{i}"] for i in indices]
-        )
+    return hl.fold(
+        lambda i, j: hl.struct(
+            **{
+                "bin_edges": (i.bin_edges),  # Bin edges are the same for all histograms
+                "bin_freq": hl.zip(i.bin_freq, j.bin_freq).map(lambda x: x[0] + x[1]),
+                "n_smaller": i.n_smaller + j.n_smaller,
+                "n_larger": i.n_larger + j.n_larger,
+            }
+        ),
+        hists[0].select("bin_edges", "bin_freq", "n_smaller", "n_larger"),
+        hists[1:],
     )
 
-    return ht
 
-
+# TODO: We know that all these HTs have the same exact rows in the same order, with the
+#  same partitioning, this might be the best use case for multi_way_zip_join.
 def combine_freq_hts(
     freq_hts: hl.DictExpression,
     row_annotations: List[str],
-    globals_annotations: List[str],
+    global_annotations: List[str],
+    age_hists: List[str] = AGE_HISTS,
+    qual_hists: List[str] = QUAL_HISTS,
 ) -> hl.Table:
     """
     Combine frequency HTs into a single HT.
 
     :param freq_hts: Dictionary of frequency HTs.
     :param row_annotations: List of annotations to put onto one hail Table.
-    :param globals_annotations: List of global annotations to put onto one hail Table.
+    :param global_annotations: List of global annotations to put onto one hail Table.
     :return: HT with all freq_hts annotations.
     """
-    # Create new HT with just variants and downsamplings global annotation to join onto
-    freq_ht = freq_hts[1].select().select_globals("downsamplings")
+    n_hts_range = range(len(freq_hts))
+    freq_ht = hl.Table.multi_way_zip_join(freq_hts, "ann_array", "global_array")
 
-    # Annotate all hts' annotations with a idx suffix to the new HT. We don't remove
-    # variants when splitting the VDS so each table has all rows.
-    logger.info("Annotating frequency HT with split HT dense dependent annotations")
-    freq_ht = freq_ht.annotate(
-        **{
-            f"{ann}_{idx}": freq_hts[idx][freq_ht.key][ann]
-            for idx in freq_hts.keys()
-            for ann in row_annotations
-        }
-    )
-    freq_ht = freq_ht.annotate_globals(
-        **{
-            f"{ann}_{idx}": freq_hts[idx].index_globals()[ann]
-            for idx in freq_hts.keys()
-            for ann in globals_annotations
-        }
-    )
-
-    # Combine freq arrays and high ab het counts by group arrays into single annotations
+    # Combine freq arrays and high ab het counts by group arrays into single
+    # annotations.
     logger.info(
         "Merging frequency arrays, metadata, and high ab het counts by group array..."
     )
     comb_freq, comb_freq_meta, comb_high_ab_hets = merge_freq_arrays(
-        farrays=[freq_ht[f"freq_{idx}"] for idx in freq_hts.keys()],
-        fmeta=[freq_ht[f"freq_meta_{idx}"] for idx in freq_hts.keys()],
+        farrays=[freq_ht.ann_array[i].freq for i in n_hts_range],
+        fmeta=[freq_ht.global_array[i].freq_meta for i in n_hts_range],
         count_arrays=[
-            freq_ht[f"high_ab_hets_by_group_membership_{idx}"]
-            for idx in freq_hts.keys()
+            freq_ht.ann_array[i].high_ab_hets_by_group_membership for i in n_hts_range
         ],
     )
-    # TODO: We want to drop all _idx annotations here but keeping them around for now for testing
-    # This could also live in the merge function, passed as a boolean parameter
     freq_ht = freq_ht.annotate(
         freq=comb_freq,
         high_ab_hets_by_group_membership=comb_high_ab_hets,
     )
 
-    # Merge all histograms into single annotations
+    # Merge all histograms into single annotations.
     logger.info("Merging all histograms...")
-    freq_ht = merge_histograms(freq_ht, freq_hts.keys())
+    hist_structs = {
+        "qual_hists": qual_hists,
+        "raw_qual_hists": qual_hists,
+        "age_hists": age_hists,
+    }
+    hists_expr = {
+        hist_struct: hl.struct(
+            **{
+                h: merge_histograms(
+                    [freq_ht.ann_array[i][hist_struct][h] for i in n_hts_range]
+                )
+                for h in hists
+            }
+        )
+        for hist_struct, hists in hist_structs.items()
+    }
+    freq_ht = freq_ht.annotate(**hists_expr)
 
-    logger.info("Final frequency HT schema...")
-    freq_ht.describe()
     logger.info("Making freq index dict...")
-    # Add our additional strata to the sort order, keeping group, i.e. adj, at the end
+    # Add our additional strata to the sort order, keeping group, i.e. adj, at the end.
     sort_order = deepcopy(SORT_ORDER)
-    sort_order[-1:-1] = ["gatk_version", "ukb_sample", "sample_age_bin"]
-    freq_ht = freq_ht.annotate_globals(freq_meta=hl.eval(comb_freq_meta))
+    sort_order[-1:-1] = ["gatk_version", "ukb_sample"]
+    freq_ht = freq_ht.annotate_globals(
+        downsamplings=freq_ht.global_array[0].downsamplings, freq_meta=comb_freq_meta
+    )
     freq_ht = freq_ht.annotate_globals(
         freq_index_dict=make_freq_index_dict_from_meta(
             freq_meta=freq_ht.freq_meta,
             label_delimiter="_",
             sort_order=sort_order,
-            # TODO: Check if we actually want to see age_bin, I dont thin we do
         ),
     )
+    # TODO: We want to drop all zip join annotations here but keeping them around for
+    #  now for testing This could also live in the merge function, passed as a boolean
+    #  parameter
+    # freq_ht = freq_ht.select(*row_annotations)
+    # freq_ht = freq_ht.select_globals(*global_annotations)
+
+    logger.info("Final frequency HT schema...")
+    freq_ht.describe()
 
     return freq_ht
 
 
-def main(args):  # noqa: D103
+# TODO: I have not started looking at any of these functions yet.
+# Functions to correct frequencies and hists for high ab hets.
+def create_high_ab_age_hists_expr(ht: hl.Table, age_group_key="sample_age_bin"):
+    """
+    Create histograms of high ab counts using age bins to account for high AB hets becoming hom alts.
+
+    :param ht: Hail Table containing age hists, AB annotation.
+    :param age_group_key: Age group key to use for age histogram.
+    :return: Hail struct containing age histogram of high ab counts.
+    """
+    non_range_entries = hl.set(["n_larger", "n_smaller"])
+    age_bins_indices = hl.sorted(
+        hl.enumerate(ht["freq_meta"], index_first=False)
+        .filter(lambda x: x[0].contains(age_group_key))
+        .map(lambda x: (x[0][age_group_key], x[1]))
+    )
+
+    age_bins_indices_dict = hl.dict(age_bins_indices)
+    age_bin_indices_no_edges = age_bins_indices.filter(
+        lambda x: ~non_range_entries.contains(x[0])
+    )
+    return hl.struct(
+        bin_freq=hl.starmap(
+            lambda x, y: ht.high_ab_hets_by_group_membership[y],
+            age_bin_indices_no_edges,
+        ),
+        n_smaller=ht.high_ab_hets_by_group_membership[
+            age_bins_indices_dict["n_smaller"]
+        ],
+        n_larger=ht.high_ab_hets_by_group_membership[age_bins_indices_dict["n_larger"]],
+    )
+
+
+def generate_faf_grpmax(ht: hl.Table) -> hl.Table:
+    """
+    Compute filtering allele frequencies and grpmax with the AB-adjusted frequencies.
+
+    :param ht: Hail Table containing freq, ab_adjusted_freq, high_ab_het annotations.
+    :return: Hail Table with faf & grpmax annotations.
+    """
+    faf, faf_meta = faf_expr(
+        ht.ab_adjusted_freq, ht.freq_meta, ht.locus, POPS_TO_REMOVE_FOR_POPMAX
+    )
+    ht = ht.annotate(
+        faf=faf,
+        grpmax=pop_max_expr(
+            ht.ab_adjusted_freq, ht.freq_meta, POPS_TO_REMOVE_FOR_POPMAX
+        ),
+    )
+    ht = ht.annotate_globals(
+        faf_meta=faf_meta,
+        faf_index_dict=make_faf_index_dict(faf_meta, label_delimiter="-"),
+    )
+    ht = ht.annotate(
+        grpmax=ht.grpmax.annotate(
+            faf95=ht.faf[
+                ht.faf_meta.index(lambda x: x.values() == ["adj", ht.grpmax.pop])
+            ].faf95
+        )
+    )
+    return ht
+
+
+def correct_call_stats(ht: hl.Table, af_threshold: float = 0.01) -> hl.Table:
+    """
+    Correct frequencies at sites with an AF greater than the af_threshold.
+
+    :param ht: Hail Table containing freq and high_ab_het annotations.
+    :param af_threshold: AF threshold at which to correct frequency. Default is 0.01.
+    :return: Hail Table with adjusted frequencies.
+    """
+    ht = ht.annotate(
+        ab_adjusted_freq=hl.if_else(
+            ht.freq[0].AF > af_threshold,
+            hl.map(
+                lambda f, g: hl.struct(
+                    AC=hl.int32(f.AC + g),
+                    AN=f.AN,
+                    homozygote_count=f.homozygote_count + g,
+                    AF=hl.if_else(f.AN > 0, (f.AC + g) / f.AN, hl.missing(hl.tfloat64)),
+                ),
+                ht.freq,
+                ht.high_ab_hets_by_group_membership,
+            ),
+            ht.freq,
+        )
+    )
+
+    return ht
+
+
+def correct_qual_hists(ht: hl.Table) -> hl.Table:  # add ab_threshold as arg
+    """
+    Correct quality metrics histograms.
+
+    Correct by accessing the qual_hist and raw_qual_hist structs and removing
+    all counts from the ab_hist_alt array where bin_edges exceed 0.9 AB.
+
+    :param ht: Hail Table containing qual hists, AB annotation.
+    :return: Hail Table
+    """
+
+    def _correct_ab_hist_alt(ab_hist_alt):
+        return hl.struct(
+            bin_edges=ab_hist_alt.bin_edges,
+            bin_freq=hl.map(
+                lambda edge, freq: hl.if_else(edge >= 0.9, 0, freq),
+                ab_hist_alt.bin_edges[:-1],
+                ab_hist_alt.bin_freq,
+            ),
+            n_smaller=ab_hist_alt.n_smaller,
+            n_larger=0,
+        )
+
+    qual_hists = ["qual_hists", "raw_qual_hists"]
+    ht = ht.annotate(
+        **{
+            x: ht[x].annotate(ab_hist_alt=_correct_ab_hist_alt(ht[x].ab_hist_alt))
+            for x in qual_hists
+        }
+    )
+    return ht
+
+
+def correct_age_hists(ht: hl.Table) -> hl.Table:
+    """
+    Correct age histograms.
+
+    Correct by subtracting age_high_ab_hists from age_hist_het and adding
+    age_high_ab_hists to age_hist_hom to account for high AB hets becoming hom alts.
+
+    :param ht: Hail Table containing age hists and hist of AB counts by age annotation.
+    :return: Hail Table
+    """
+    ht = ht.annotate(age_high_ab_hist=create_high_ab_age_hists_expr(ht))
+
+    return ht.annotate(
+        age_hist_het=hl.struct(
+            bin_edges=ht.age_hist_het.bin_edges,
+            bin_freq=hl.map(
+                lambda x, y: x - y,
+                ht.age_hist_het.bin_freq,
+                ht.age_high_ab_hist.bin_freq,
+            ),
+            n_smaller=ht.age_hist_het.n_smaller - ht.age_high_ab_hist.n_smaller,
+            n_larger=ht.age_hist_het.n_larger - ht.age_high_ab_hist.n_larger,
+        ),
+        age_hist_hom=hl.struct(
+            bin_edges=ht.age_hist_hom.bin_edges,
+            bin_freq=hl.map(
+                lambda x, y: x + y,
+                ht.age_hist_hom.bin_freq,
+                ht.age_high_ab_hist.bin_freq,
+            ),
+            n_smaller=ht.age_hist_hom.n_smaller + ht.age_high_ab_hist.n_smaller,
+            n_larger=ht.age_hist_hom.n_larger + ht.age_high_ab_hist.n_larger,
+        ),
+    )
+
+
+# TODO: add automatic copy of log file.
+def main(args):
     """Script to generate frequency and dense dependent annotations on v4 exomes."""
     use_test_dataset = args.use_test_dataset
     test_n_partitions = args.test_n_partitions
@@ -760,17 +653,21 @@ def main(args):  # noqa: D103
                 " densification..."
             )
             vds_list = split_vds_by_strata(vds, strata_expr=vds.variant_data.ukb_sample)
-            freq_hts = {}
-
-            # Make a dict of freq hts with idx as key which will be used when joining
-            # annotations. This is more straight forward to me than using joins since
-            # hail keeps the existing annotation on the left table and the right table
-            # gets a suffix added to the same annotation. This way, every table's
-            # annotation will end up with a suffix in the merge.
+            freq_hts = []
             for idx, vds in enumerate(vds_list, start=1):
                 freq_ht = generate_freq_and_hists_ht(vds, ab_cutoff=ab_cutoff, idx=idx)
-                freq_hts[idx] = freq_ht
-
+                # TODO: Probably good to add a checkpoint here, and we might want to
+                #   use a fixed location in gnomad_tmp instead of new_temp_file so we
+                #   can easily rerun only failed ones if needed?
+                # TODO: Actually, do we want to parallelize this in some way?
+                freq_hts.append(
+                    freq_ht.checkpoint(
+                        # new_temp_file(f"freq_ht_{idx}", extension="ht"),
+                        f"gs://gnomad-tmp/julia/v4/frequencies/test/freq_ht_{idx}.ht",
+                        overwrite=args.overwrite,
+                        _read_if_exists=True,
+                    )
+                )
             freq_ht = combine_freq_hts(freq_hts, FREQ_ROW_FIELDS, FREQ_GLOBAL_FIELDS)
         else:
             freq_ht = generate_freq_and_hists_ht(vds, ab_cutoff=ab_cutoff)
