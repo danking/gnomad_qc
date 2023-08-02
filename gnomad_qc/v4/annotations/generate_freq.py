@@ -437,7 +437,8 @@ def combine_freq_hts(
     sort_order = deepcopy(SORT_ORDER)
     sort_order[-1:-1] = ["gatk_version", "ukb_sample"]
     freq_ht = freq_ht.annotate_globals(
-        downsamplings=freq_ht.global_array[0].downsamplings, freq_meta=comb_freq_meta
+        downsamplings=freq_ht.global_array[0].downsamplings,
+        freq_meta=hl.eval(comb_freq_meta),
     )
     freq_ht = freq_ht.annotate_globals(
         freq_index_dict=make_freq_index_dict_from_meta(
@@ -665,7 +666,7 @@ def main(args):
                         # new_temp_file(f"freq_ht_{idx}", extension="ht"),
                         f"gs://gnomad-tmp/julia/v4/frequencies/test/freq_ht_{idx}.ht",
                         overwrite=args.overwrite,
-                        _read_if_exists=True,
+                        _read_if_exists=False,
                     )
                 )
             freq_ht = combine_freq_hts(freq_hts, FREQ_ROW_FIELDS, FREQ_GLOBAL_FIELDS)
