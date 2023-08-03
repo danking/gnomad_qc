@@ -24,6 +24,7 @@ from gnomad.utils.annotations import (
     faf_expr,
     get_adj_expr,
     merge_freq_arrays,
+    merge_histograms,
     pop_max_expr,
     qual_hist_expr,
     set_female_y_metrics_to_na_expr,
@@ -54,6 +55,7 @@ AGE_HISTS = [
     "age_hist_het",
     "age_hist_hom",
 ]
+# TODO: Add documentation.
 QUAL_HISTS = [
     "gq_hist_all",
     "dp_hist_all",
@@ -61,10 +63,10 @@ QUAL_HISTS = [
     "dp_hist_alt",
     "ab_hist_alt",
 ]
-
+# TODO: Add documentation.
 FREQ_ROW_FIELDS = [
     "freq",
-    "high_ab_hets_by_group_membership",
+    "high_ab_hets_by_group",
     "qual_hists",
     "raw_qual_hists",
     "age_hists",
@@ -207,6 +209,25 @@ def get_vds_for_freq(
     return vds
 
 
+def is_haploid(
+    locus_expr: hl.expr.LocusExpression,
+    karyotype_expr: hl.expr.StringExpression,
+) -> hl.expr.CallExpression:
+    """
+    Add description.
+
+    :param locus_expr: Hail locus expression.
+    :param karyotype_expr:
+    """
+    xy = karyotype_expr == "XY"
+    xx = karyotype_expr == "XX"
+    x_nonpar = locus_expr.in_x_nonpar()
+    y_par = locus_expr.in_y_par()
+    y_nonpar = locus_expr.in_y_nonpar()
+
+    return hl.or_missing(~(xx & (y_par | y_nonpar)), xy & (x_nonpar | y_nonpar))
+
+
 def annotate_adj_and_select_fields(vds: hl.vds.VariantDataset) -> hl.vds.VariantDataset:
     """
     Annotate adj, _het_ad, and select fields to reduce memory usage.
@@ -217,17 +238,35 @@ def annotate_adj_and_select_fields(vds: hl.vds.VariantDataset) -> hl.vds.Variant
     rmt = vds.reference_data
     vmt = vds.variant_data
 
+    logger.info("Computing sex adjusted genotypes...")
+    rmt_sex_expr = vmt.cols()[rmt.col_key].sex_karyotype
+    rmt.filter_entries(
+        (rmt.locus.in_y_par() | rmt.locus.in_y_nonpar()) & (rmt_sex_expr == "XX"),
+        keep=False,
+    )
     rmt = rmt.annotate_entries(
-        adj=(rmt.DP >= 10) & (rmt.GQ >= 20)
-    )  # TODO: confirm this doesn't mess up haploids
+        adj=(rmt.GQ >= 20)
+        & hl.if_else(
+            ~rmt.locus.in_autosome() & is_haploid(rmt.locus, rmt_sex_expr),
+            rmt.DP >= 5,
+            rmt.DP >= 10,
+        )
+    )
+
+    vmt_gt_expr = hl.if_else(
+        vmt.locus.in_autosome(),
+        vmt.GT,
+        adjusted_sex_ploidy_expr(vmt.locus, vmt.GT, vmt.sex_karyotype),
+    )
     vmt = vmt.select_entries(
         "_het_non_ref",
         "DP",
         "GQ",
-        "GT",
-        adj=get_adj_expr(vmt.GT, vmt.GQ, vmt.DP, vmt.AD),
+        GT=vmt_gt_expr,
+        adj=get_adj_expr(vmt_gt_expr, vmt.GQ, vmt.DP, vmt.AD),
         _het_ad=vmt.AD[1],
     )
+
     return hl.vds.VariantDataset(rmt, vmt)
 
 
@@ -267,11 +306,6 @@ def generate_freq_and_hists_ht(
     logger.info("Densifying VDS # %s...", idx)
     mt = hl.vds.to_dense_mt(vds)
 
-    logger.info("Computing sex adjusted genotypes...")
-    mt = mt.transmute_entries(
-        GT=adjusted_sex_ploidy_expr(mt.locus, mt.GT, mt.sex_karyotype),
-    )
-
     logger.info("Annotating frequencies and counting high AB het calls...")
     additional_strata_expr = [
         {"gatk_version": mt.gatk_version},
@@ -297,9 +331,7 @@ def generate_freq_and_hists_ht(
         downsampling_expr=mt.downsampling,
         ds_pop_counts=hl.eval(mt.ds_pop_counts),
         additional_strata_expr=additional_strata_expr,
-        entry_agg_funcs={
-            "high_ab_hets_by_group_membership": (_needs_high_ab_het_fix, hl.agg.sum)
-        },
+        entry_agg_funcs={"high_ab_hets_by_group": (_needs_high_ab_het_fix, hl.agg.sum)},
         annotate_mt=False,
     )
 
@@ -321,8 +353,6 @@ def generate_freq_and_hists_ht(
     logger.info(
         "Computing quality metrics histograms and age histograms for each variant..."
     )
-    # TODO: Can I ask a stupid question? Why do we need to add the age strata to
-    #  annotate_freq? Why can't we just compute the corrected hists here?
     mt = mt.select_rows(
         **qual_hist_expr(
             gt_expr=mt.GT,
@@ -349,34 +379,7 @@ def generate_freq_and_hists_ht(
     return freq_ht
 
 
-# TODO: Move to gnomad_methods.
-def merge_histograms(hists: List[hl.expr.StructExpression]) -> hl.Table:
-    """
-    Merge histogram annotations.
-
-    This function merges all split histogram annotations by
-    summing the arrays in an element-wise fashion. It keeps one bin_edge annotation
-    but merges the bin_freq, n_smaller, and n_larger annotations by summing them.
-
-    :param hists: List of histogram structs to merge.
-    :return: Merged histogram struct.
-    """
-    return hl.fold(
-        lambda i, j: hl.struct(
-            **{
-                "bin_edges": (i.bin_edges),  # Bin edges are the same for all histograms
-                "bin_freq": hl.zip(i.bin_freq, j.bin_freq).map(lambda x: x[0] + x[1]),
-                "n_smaller": i.n_smaller + j.n_smaller,
-                "n_larger": i.n_larger + j.n_larger,
-            }
-        ),
-        hists[0].select("bin_edges", "bin_freq", "n_smaller", "n_larger"),
-        hists[1:],
-    )
-
-
-# TODO: We know that all these HTs have the same exact rows in the same order, with the
-#  same partitioning, this might be the best use case for multi_way_zip_join.
+# TODO: add to params.
 def combine_freq_hts(
     freq_hts: hl.DictExpression,
     row_annotations: List[str],
@@ -403,13 +406,11 @@ def combine_freq_hts(
     comb_freq, comb_freq_meta, comb_high_ab_hets = merge_freq_arrays(
         farrays=[freq_ht.ann_array[i].freq for i in n_hts_range],
         fmeta=[freq_ht.global_array[i].freq_meta for i in n_hts_range],
-        count_arrays=[
-            freq_ht.ann_array[i].high_ab_hets_by_group_membership for i in n_hts_range
-        ],
+        count_arrays=[freq_ht.ann_array[i].high_ab_hets_by_group for i in n_hts_range],
     )
     freq_ht = freq_ht.annotate(
         freq=comb_freq,
-        high_ab_hets_by_group_membership=comb_high_ab_hets,
+        high_ab_hets_by_group=comb_high_ab_hets,
     )
 
     # Merge all histograms into single annotations.
@@ -447,11 +448,8 @@ def combine_freq_hts(
             sort_order=sort_order,
         ),
     )
-    # TODO: We want to drop all zip join annotations here but keeping them around for
-    #  now for testing This could also live in the merge function, passed as a boolean
-    #  parameter
-    # freq_ht = freq_ht.select(*row_annotations)
-    # freq_ht = freq_ht.select_globals(*global_annotations)
+    freq_ht = freq_ht.select(*row_annotations)
+    freq_ht = freq_ht.select_globals(*global_annotations)
 
     logger.info("Final frequency HT schema...")
     freq_ht.describe()
@@ -459,7 +457,6 @@ def combine_freq_hts(
     return freq_ht
 
 
-# TODO: I have not started looking at any of these functions yet.
 # Functions to correct frequencies and hists for high ab hets.
 def create_high_ab_age_hists_expr(ht: hl.Table, age_group_key="sample_age_bin"):
     """
@@ -482,13 +479,11 @@ def create_high_ab_age_hists_expr(ht: hl.Table, age_group_key="sample_age_bin"):
     )
     return hl.struct(
         bin_freq=hl.starmap(
-            lambda x, y: ht.high_ab_hets_by_group_membership[y],
+            lambda x, y: ht.high_ab_hets_by_group[y],
             age_bin_indices_no_edges,
         ),
-        n_smaller=ht.high_ab_hets_by_group_membership[
-            age_bins_indices_dict["n_smaller"]
-        ],
-        n_larger=ht.high_ab_hets_by_group_membership[age_bins_indices_dict["n_larger"]],
+        n_smaller=ht.high_ab_hets_by_group[age_bins_indices_dict["n_smaller"]],
+        n_larger=ht.high_ab_hets_by_group[age_bins_indices_dict["n_larger"]],
     )
 
 
@@ -541,7 +536,7 @@ def correct_call_stats(ht: hl.Table, af_threshold: float = 0.01) -> hl.Table:
                     AF=hl.if_else(f.AN > 0, (f.AC + g) / f.AN, hl.missing(hl.tfloat64)),
                 ),
                 ht.freq,
-                ht.high_ab_hets_by_group_membership,
+                ht.high_ab_hets_by_group,
             ),
             ht.freq,
         )
@@ -647,7 +642,6 @@ def main(args):
             "Getting multi-allelic split VDS with adj and _het_AD entry annotations..."
         )
         vds = get_vds_for_freq(use_test_dataset, test_gene, test_n_partitions, chrom)
-
         if args.split_vds_by_annotation:
             logger.info(
                 "Splitting VDS by ukb_sample annotation to reduce data size for"
@@ -657,14 +651,12 @@ def main(args):
             freq_hts = []
             for idx, vds in enumerate(vds_list, start=1):
                 freq_ht = generate_freq_and_hists_ht(vds, ab_cutoff=ab_cutoff, idx=idx)
-                # TODO: Probably good to add a checkpoint here, and we might want to
-                #   use a fixed location in gnomad_tmp instead of new_temp_file so we
-                #   can easily rerun only failed ones if needed?
+                # TODO: Change to use a fixed location in gnomad_tmp instead of
+                #  new_temp_file so we can easily rerun only failed ones if needed?
                 # TODO: Actually, do we want to parallelize this in some way?
                 freq_hts.append(
                     freq_ht.checkpoint(
-                        # new_temp_file(f"freq_ht_{idx}", extension="ht"),
-                        f"gs://gnomad-tmp/julia/v4/frequencies/test/freq_ht_{idx}.ht",
+                        new_temp_file(f"freq_ht_{idx}", extension="ht"),
                         overwrite=args.overwrite,
                         _read_if_exists=False,
                     )
