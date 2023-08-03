@@ -439,6 +439,7 @@ def combine_freq_hts(
     sort_order[-1:-1] = ["gatk_version", "ukb_sample"]
     freq_ht = freq_ht.annotate_globals(
         downsamplings=freq_ht.global_array[0].downsamplings,
+        age_distribution=freq_ht.global_array[0].age_distribution,
         freq_meta=hl.eval(comb_freq_meta),
     )
     freq_ht = freq_ht.annotate_globals(
