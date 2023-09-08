@@ -852,9 +852,10 @@ def main(args):
                 "Getting multi-allelic split VDS with adj and _het_AD entry"
                 " annotations..."
             )
-            vds = get_vds_for_freq(
-                use_test_dataset, test_gene, test_n_partitions, chrom
-            )
+            vds = hl.vds.read_vds('partition_38016_split_ann.vds')
+            # vds = get_vds_for_freq(
+            #     use_test_dataset, test_gene, test_n_partitions, chrom
+            # )
             meta_ht = vds.variant_data.cols()
             ds_ht = get_downsampling_ht(vds.variant_data)
 
