@@ -29,11 +29,12 @@ def _annotations_root(
     :param data_type: Data type of annotation resource. e.g. "exomes" or "genomes". Default is "exomes".
     :return: Root path of the variant annotation files.
     """
-    return (
-        f"gs://gnomad-tmp/gnomad_v{version}_testing/annotations/{data_type}"
-        if test
-        else f"gs://gnomad/v{version}/annotations/{data_type}"
-    )
+    return "annotations_root"
+    # return (
+    #     f"gs://gnomad-tmp/gnomad_v{version}_testing/annotations/{data_type}"
+    #     if test
+    #     else f"gs://gnomad/v{version}/annotations/{data_type}"
+    # )
 
 
 def get_info(split: bool = True, test: bool = False) -> VersionedTableResource:

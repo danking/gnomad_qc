@@ -177,7 +177,8 @@ def qc_temp_prefix(version: str = CURRENT_RELEASE) -> str:
     :param version: Version of annotation path to return
     :return: Path to bucket with temporary QC data
     """
-    return f"gs://gnomad-tmp-4day/gnomad_v{version}_qc_data/"
+    return 'qc_temp_prefix/'
+    # return f"gs://gnomad-tmp-4day/gnomad_v{version}_qc_data/"
 
 
 def get_checkpoint_path(
