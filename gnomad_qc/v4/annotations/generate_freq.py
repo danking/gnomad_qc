@@ -14,6 +14,7 @@ from copy import deepcopy
 from typing import Dict, List, Optional, Tuple, Union
 
 import hail as hl
+import hailtop.fs as hfs
 from gnomad.resources.grch38.gnomad import DOWNSAMPLINGS, POPS_TO_REMOVE_FOR_POPMAX
 from gnomad.sample_qc.sex import adjusted_sex_ploidy_expr
 from gnomad.utils.annotations import (
@@ -532,7 +533,13 @@ def get_downsampling_ht(mt: hl.MatrixTable, non_ukb: bool = False) -> hl.Table:
     if non_ukb:
         downsamplings = downsamplings[:-1]
     ds_ht = annotate_downsamplings(meta_ht, downsamplings, pop_expr=meta_ht.pop)
-    ds_ht = ds_ht.checkpoint(new_temp_file("downsamplings", extension="ht"))
+
+    if not hfs.exists('dkdata/downsamplings.ht'):
+        logger.info("Determining downsampling groups...")
+        ds_ht = ds_ht.checkpoint('dkdata/downsamplings.ht')
+    else:
+        print('using cached downsamplings.ht')
+        ds_ht = hl.read_table('dkdata/downsamplings.ht')
 
     return ds_ht
 
@@ -835,11 +842,6 @@ def main(args):
     ab_cutoff = args.ab_cutoff
     af_threshold = args.af_threshold
 
-    hl.init(
-        # log="/generate_frequency_data.log",
-        default_reference="GRCh38",
-        # tmp_dir="gs://gnomad-tmp-4day",
-    )
     resources = get_freq_resources(overwrite, test, chrom)
 
     try:
