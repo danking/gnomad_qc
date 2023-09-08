@@ -836,9 +836,9 @@ def main(args):
     af_threshold = args.af_threshold
 
     hl.init(
-        log="/generate_frequency_data.log",
+        # log="/generate_frequency_data.log",
         default_reference="GRCh38",
-        tmp_dir="gs://gnomad-tmp-4day",
+        # tmp_dir="gs://gnomad-tmp-4day",
     )
     resources = get_freq_resources(overwrite, test, chrom)
 
