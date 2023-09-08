@@ -924,8 +924,9 @@ def main(args):
             ht = create_final_freq_ht(ht)
             ht.write(res.final_freq_ht.path, overwrite=args.overwrite)
     finally:
-        logger.info("Copying log to logging bucket...")
-        hl.copy_log(get_logging_path("frequency_data"))
+        pass
+        # logger.info("Copying log to logging bucket...")
+        # hl.copy_log(get_logging_path("frequency_data"))
 
 
 if __name__ == "__main__":
